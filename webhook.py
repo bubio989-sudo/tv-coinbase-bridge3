@@ -1,17 +1,18 @@
 import os
-import hmac
-import hashlib
 import time
 import json
 from datetime import datetime
 from flask import Flask, request, jsonify
 import requests
+import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 
 app = Flask(__name__)
 
 # ====== Config (set in Render env vars) ======
-CB_API_KEY = os.environ.get("CB_API_KEY", "")
-CB_API_SECRET = os.environ.get("CB_API_SECRET", "")
+CB_API_KEY_NAME = os.environ.get("CB_API_KEY_NAME", "")  # e.g., organizations/xxx/apiKeys/xxx
+CB_PRIVATE_KEY = os.environ.get("CB_PRIVATE_KEY", "")  # PEM format private key
 USE_TEN_PERCENT = os.environ.get("USE_TEN_PERCENT", "true").lower() == "true"
 CB_BASE_URL = "https://api.coinbase.com"
 
@@ -24,32 +25,60 @@ ENDPOINT_ORDER = "/api/v3/brokerage/orders"
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
-def coinbase_headers(method, path, body):
-    """Generate Coinbase Advanced Trade auth headers"""
-    timestamp = str(int(time.time()))
-    body_str = json.dumps(body) if (body and method.upper() != "GET") else ""
-    prehash = f"{timestamp}{method.upper()}{path}{body_str}"
-    signature = hmac.new(
-        CB_API_SECRET.encode("utf-8"),
-        prehash.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-    return {
-        "CB-ACCESS-KEY": CB_API_KEY,
-        "CB-ACCESS-SIGN": signature,
-        "CB-ACCESS-TIMESTAMP": timestamp,
-        "Content-Type": "application/json",
-    }
+def build_jwt(request_method, request_path):
+    """Build JWT token for Coinbase CDP API"""
+    try:
+        private_key_bytes = CB_PRIVATE_KEY.encode('utf-8')
+        private_key = serialization.load_pem_private_key(
+            private_key_bytes, password=None, backend=default_backend()
+        )
+        
+        uri = f"{request_method} {request_path}"
+        
+        jwt_payload = {
+            'sub': CB_API_KEY_NAME,
+            'iss': "coinbase-cloud",
+            'nbf': int(time.time()),
+            'exp': int(time.time()) + 120,
+            'uri': uri,
+        }
+        
+        jwt_token = jwt.encode(
+            jwt_payload,
+            private_key,
+            algorithm='ES256',
+            headers={'kid': CB_API_KEY_NAME, 'nonce': str(int(time.time()))}
+        )
+        
+        return jwt_token
+    except Exception as e:
+        log(f"❌ JWT generation error: {e}")
+        raise
 
 def cb_request(method, endpoint, params=None, body=None):
-    """Make authenticated request to Coinbase Advanced Trade API"""
+    """Make authenticated request to Coinbase CDP API"""
     url = f"{CB_BASE_URL}{endpoint}"
-    headers = coinbase_headers(method, endpoint, body)
+    
+    # Build request path for JWT (include query params if present)
+    request_path = endpoint
+    if params:
+        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+        request_path = f"{endpoint}?{query_string}"
+    
+    jwt_token = build_jwt(method.upper(), f"{CB_BASE_URL}{request_path}")
+    
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/json",
+    }
+    
     try:
         if method.upper() == "GET":
             r = requests.get(url, headers=headers, params=params, timeout=15)
         else:
             r = requests.post(url, headers=headers, data=json.dumps(body or {}), timeout=20)
+        
+        log(f"Response status: {r.status_code}")
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -234,7 +263,7 @@ def home():
         balance_html = "<br>".join([f"<strong>{k}:</strong> {v}" for k, v in list(balances.items())[:10]])
         balance_section = f'<div style="background:#e8f5e9;padding:20px;border-radius:10px;margin:20px 0"><h3>💰 Balances</h3>{balance_html}</div>'
     except Exception as e:
-        balance_section = f'<p style="color:red">⚠️ Could not fetch balances. Check API credentials.<br>Error: {str(e)}</p>'
+        balance_section = f'<p style="color:red">⚠️ Could not fetch balances.<br>Error: {str(e)}</p>'
     
     return f"""
     <!DOCTYPE html>
@@ -270,7 +299,7 @@ def home():
 
 if __name__ == "__main__":
     log("🚀 Starting TradingView → Coinbase Bridge")
-    if CB_API_KEY and CB_API_SECRET:
+    if CB_API_KEY_NAME and CB_PRIVATE_KEY:
         log("✅ API credentials loaded")
         try:
             balances = get_balances()
