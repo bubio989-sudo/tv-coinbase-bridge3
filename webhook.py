@@ -25,33 +25,53 @@ def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 def coinbase_headers(method, path, body):
-    """Generate Coinbase Advanced Trade auth headers (Legacy API)"""
+    """Generate Coinbase Advanced Trade auth headers"""
     timestamp = str(int(time.time()))
-    body_str = json.dumps(body) if body else ""
+    
+    # Body must be empty string for GET, JSON string for POST
+    if method.upper() == "GET":
+        body_str = ""
+    else:
+        body_str = json.dumps(body) if body else ""
+    
+    # The message to sign
     message = f"{timestamp}{method.upper()}{path}{body_str}"
     
-    log(f"🔐 Signing: {message[:100]}...")
+    log(f"🔐 Timestamp: {timestamp}")
+    log(f"🔐 Method: {method.upper()}")
+    log(f"🔐 Path: {path}")
+    log(f"🔐 Body: {body_str[:100] if body_str else '(empty)'}")
+    log(f"🔐 Message to sign: {message[:200]}")
+    log(f"🔐 API Key (first 10 chars): {CB_API_KEY[:10]}...")
+    log(f"🔐 API Secret (first 10 chars): {CB_API_SECRET[:10]}...")
+    log(f"🔐 API Secret length: {len(CB_API_SECRET)}")
     
+    # Create signature
     signature = hmac.new(
         CB_API_SECRET.encode('utf-8'),
         message.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
     
-    return {
+    log(f"🔐 Signature: {signature[:20]}...")
+    
+    headers = {
         "CB-ACCESS-KEY": CB_API_KEY,
         "CB-ACCESS-SIGN": signature,
         "CB-ACCESS-TIMESTAMP": timestamp,
         "Content-Type": "application/json",
     }
+    
+    return headers
 
 def cb_request(method, endpoint, params=None, body=None):
     """Make authenticated request to Coinbase Advanced Trade API"""
     url = f"{CB_BASE_URL}{endpoint}"
     headers = coinbase_headers(method, endpoint, body)
     
-    log(f"📡 {method} {url}")
-    log(f"Headers: CB-ACCESS-KEY={CB_API_KEY[:8]}... CB-ACCESS-TIMESTAMP={headers['CB-ACCESS-TIMESTAMP']}")
+    log(f"📡 Making request: {method} {url}")
+    if params:
+        log(f"📡 Params: {params}")
     
     try:
         if method.upper() == "GET":
@@ -59,19 +79,17 @@ def cb_request(method, endpoint, params=None, body=None):
         else:
             r = requests.post(url, headers=headers, json=body, timeout=20)
         
-        log(f"📥 Response: {r.status_code}")
+        log(f"📥 Response status: {r.status_code}")
+        log(f"📥 Response headers: {dict(r.headers)}")
+        log(f"📥 Response body: {r.text[:500]}")
         
         if r.status_code >= 400:
-            log(f"❌ Error response: {r.text}")
+            log(f"❌ ERROR RESPONSE: {r.text}")
+            raise Exception(f"Coinbase API returned {r.status_code}: {r.text}")
         
-        r.raise_for_status()
         return r.json()
-    except requests.exceptions.HTTPError as e:
-        log(f"❌ HTTP Error: {e}")
-        log(f"Response body: {e.response.text if e.response else 'No response'}")
-        raise
     except Exception as e:
-        log(f"❌ Request error: {e}")
+        log(f"❌ Exception: {type(e).__name__}: {str(e)}")
         raise
 
 def parse_kv(raw):
@@ -110,7 +128,7 @@ def get_balances():
     cursor = None
     attempt = 0
     
-    while attempt < 5:  # Prevent infinite loops
+    while attempt < 5:
         attempt += 1
         params = {}
         if cursor:
@@ -254,6 +272,28 @@ def health():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@app.route("/test", methods=["GET"])
+def test():
+    """Test API credentials"""
+    log("=" * 60)
+    log("🧪 TESTING API CREDENTIALS")
+    log(f"API Key present: {bool(CB_API_KEY)}")
+    log(f"API Key length: {len(CB_API_KEY)}")
+    log(f"API Key first 10: {CB_API_KEY[:10] if CB_API_KEY else 'MISSING'}")
+    log(f"API Secret present: {bool(CB_API_SECRET)}")
+    log(f"API Secret length: {len(CB_API_SECRET)}")
+    log(f"API Secret first 10: {CB_API_SECRET[:10] if CB_API_SECRET else 'MISSING'}")
+    
+    try:
+        balances = get_balances()
+        log("✅ SUCCESS!")
+        log("=" * 60)
+        return jsonify({"status": "success", "balances": balances}), 200
+    except Exception as e:
+        log(f"❌ FAILED: {str(e)}")
+        log("=" * 60)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.route("/", methods=["GET"])
 def home():
     """Home page"""
@@ -278,6 +318,7 @@ def home():
             h1{{color:#0052FF;text-align:center}}
             .status{{color:#00C853;font-weight:bold;font-size:1.3em}}
             code{{background:#f0f0f0;padding:5px 10px;border-radius:5px}}
+            a{{display:inline-block;margin:10px;padding:10px 20px;background:#0052FF;color:white;text-decoration:none;border-radius:5px}}
         </style>
     </head>
     <body>
@@ -289,6 +330,8 @@ def home():
                 <h3>📡 Endpoints</h3>
                 <p><strong>Webhook:</strong> <code>POST /webhook</code></p>
                 <p><strong>Health:</strong> <code>GET /health</code></p>
+                <p><strong>Test:</strong> <code>GET /test</code></p>
+                <a href="/test" target="_blank">🧪 Run Test</a>
             </div>
             <div style="background:#fff3e0;padding:15px;border-radius:8px">
                 <h3>📝 Alert Format</h3>
@@ -302,19 +345,14 @@ def home():
 if __name__ == "__main__":
     log("🚀 Starting TradingView → Coinbase Bridge")
     log(f"API Key present: {bool(CB_API_KEY)}")
+    log(f"API Key length: {len(CB_API_KEY) if CB_API_KEY else 0}")
     log(f"API Secret present: {bool(CB_API_SECRET)}")
+    log(f"API Secret length: {len(CB_API_SECRET) if CB_API_SECRET else 0}")
     
     if CB_API_KEY and CB_API_SECRET:
-        log("✅ API credentials loaded")
-        try:
-            balances = get_balances()
-            log("✅ Connected to Coinbase!")
-            for currency, amount in balances.items():
-                log(f"   {currency}: {amount}")
-        except Exception as e:
-            log(f"⚠️ Could not fetch balances: {e}")
+        log("✅ API credentials loaded from environment")
     else:
-        log("⚠️ API credentials not set in environment variables!")
+        log("⚠️ WARNING: API credentials not set in environment variables!")
     
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
